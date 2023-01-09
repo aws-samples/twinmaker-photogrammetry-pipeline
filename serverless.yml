@@ -1,0 +1,370 @@
+service: pipeline
+
+custom:
+  prune:
+    automatic: true
+    number: 1
+  webpack:
+    includeModules: true
+  vars:
+    LANDING_BUCKET: gpb-data-landing-${self:provider.stage}
+    PROCESSED_BUCKET: gpb-data-processed-${self:provider.stage}
+    TWINMAKER_WORKSPACE_BUCKET: gpb-data-twinmaker-workspace-${self:provider.stage}
+    TASK_TRACK_TABLE: gbp-task-track-${self:provider.stage}
+
+provider:
+  name: aws
+  runtime: nodejs14.x
+  region: us-east-1
+  stage: ${opt:stage, 'dev'}
+  environment:
+    LANDING_BUCKET: ${self:custom.vars.LANDING_BUCKET}
+    PROCESSED_BUCKET: ${self:custom.vars.PROCESSED_BUCKET}
+  iamRoleStatements:
+    - Effect: "Allow"
+      Action:
+        - "ec2:DeleteNetworkInterface"
+        - "ec2:DetachNetworkInterface"
+        - "ec2:DescribeNetworkInterfaces"
+      Resource: 
+        - "*"
+    - Effect: "Allow"
+      Action:
+        - "iottwinmaker:*"
+      Resource: 
+        - "*"
+    - Effect: "Allow"
+      Action:
+        - "dynamodb:*"
+      Resource: 
+        - "arn:aws:dynamodb:#{AWS::Region}:#{AWS::AccountId}:table/${self:custom.vars.TASK_TRACK_TABLE}"
+    - Effect: Allow
+      Action:
+        - "s3:*"
+      Resource:
+        - "arn:aws:s3:::${self:custom.vars.LANDING_BUCKET}"
+        - "arn:aws:s3:::${self:custom.vars.LANDING_BUCKET}/*"
+        - "arn:aws:s3:::${self:custom.vars.PROCESSED_BUCKET}"
+        - "arn:aws:s3:::${self:custom.vars.PROCESSED_BUCKET}/*"
+        - "arn:aws:s3:::${self:custom.vars.TWINMAKER_WORKSPACE_BUCKET}"
+        - "arn:aws:s3:::${self:custom.vars.TWINMAKER_WORKSPACE_BUCKET}/*"
+  s3:
+    landingBucket:
+      name: ${self:custom.vars.LANDING_BUCKET}
+      accelerateConfiguration: 
+        AccelerationStatus: Enabled
+    processedBucket:
+      name: ${self:custom.vars.PROCESSED_BUCKET}
+plugins:
+  - serverless-webpack
+  - serverless-prune-plugin
+  - serverless-plugin-vpc-eni-cleanup
+
+functions:
+  processor:
+    handler: src/processor.handler
+    memorySize: 10240
+    timeout: 900
+    ephemeralStorageSize: 10240
+    vpc:
+      securityGroupIds:
+        - !GetAtt MySecurityGroup.GroupId
+      subnetIds:
+        - !Ref PrivateSubnet1
+    environment:
+      TASK_TRACK_TABLE: ${self:custom.vars.TASK_TRACK_TABLE}
+      LB_URL:
+        Fn::GetAtt:
+          - Alb
+          - DNSName
+    events:
+      - s3:
+          bucket: landingBucket
+          event:
+            - s3:ObjectCreated:*
+  completePoller:
+    handler: src/completePoller.handler
+    memorySize: 10240
+    timeout: 900
+    ephemeralStorageSize: 10240
+    vpc:
+      securityGroupIds:
+        - !GetAtt MySecurityGroup.GroupId
+      subnetIds:
+        - !Ref PrivateSubnet1
+    environment:
+      TASK_TRACK_TABLE: ${self:custom.vars.TASK_TRACK_TABLE}
+      LB_URL:
+        Fn::GetAtt:
+          - Alb
+          - DNSName
+    events:
+      - schedule:
+          rate: rate(5 minutes)
+  gltfConverter:
+    handler: src/gltfConverter.handler
+    memorySize: 10240
+    timeout: 900
+    ephemeralStorageSize: 10240
+    vpc:
+      securityGroupIds:
+        - !GetAtt MySecurityGroup.GroupId
+      subnetIds:
+        - !Ref PrivateSubnet1
+    environment:
+      TWINMAKER_WORKSPACE_BUCKET: ${self:custom.vars.TWINMAKER_WORKSPACE_BUCKET}
+    events:
+      - s3:
+          bucket: processedBucket
+          event:
+            - s3:ObjectCreated:*   
+
+resources:
+  Resources:
+    MySecurityGroup:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupDescription: Allow all outbound traffic, no inbound for Lambdas
+        SecurityGroupIngress:
+          - CidrIp: 0.0.0.0/0
+            IpProtocol: -1
+        VpcId: vpc-0e0502c7887a495dd
+    PrivateSubnet1:
+      Type: AWS::EC2::Subnet
+      Properties:
+        AvailabilityZone: us-east-1a
+        CidrBlock: 172.31.144.0/20
+        VpcId: vpc-0e0502c7887a495dd
+    PrivateSubnet2:
+      Type: AWS::EC2::Subnet
+      Properties:
+        AvailabilityZone: us-east-1b
+        CidrBlock: 172.31.160.0/20
+        VpcId: vpc-0e0502c7887a495dd
+    RouteTableAssociation1:
+        Type: AWS::EC2::SubnetRouteTableAssociation
+        Properties:
+          RouteTableId: !Ref PrivateRouteTable
+          SubnetId: !Ref PrivateSubnet1
+    RouteTableAssociation2:
+        Type: AWS::EC2::SubnetRouteTableAssociation
+        Properties:
+          RouteTableId: !Ref PrivateRouteTable
+          SubnetId: !Ref PrivateSubnet2
+    PrivateRouteTable:
+      Type: AWS::EC2::RouteTable
+      Properties:
+        VpcId: vpc-0e0502c7887a495dd
+    S3Endpoint:
+      Type: AWS::EC2::VPCEndpoint
+      Properties:
+        RouteTableIds:
+          - !Ref PrivateRouteTable
+        ServiceName: !Sub 'com.amazonaws.#{AWS::Region}.s3'
+        VpcId: vpc-0e0502c7887a495dd
+    DynamoEndpoint:
+      Type: AWS::EC2::VPCEndpoint
+      Properties:
+        RouteTableIds:
+          - !Ref PrivateRouteTable
+        ServiceName: !Sub 'com.amazonaws.#{AWS::Region}.dynamodb'
+        VpcId: vpc-0e0502c7887a495dd
+    EcrApiEndpoint:
+      Type: AWS::EC2::VPCEndpoint
+      Properties:
+        ServiceName: !Sub 'com.amazonaws.#{AWS::Region}.ecr.api'
+        VpcEndpointType: Interface
+        VpcId: vpc-0e0502c7887a495dd
+        SubnetIds: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+        SecurityGroupIds:
+          - !Ref MySecurityGroup
+        PrivateDnsEnabled: true   
+    EcrDkrEndpoint:
+      Type: AWS::EC2::VPCEndpoint
+      Properties:
+        ServiceName: !Sub 'com.amazonaws.#{AWS::Region}.ecr.dkr'
+        VpcEndpointType: Interface
+        VpcId: vpc-0e0502c7887a495dd
+        SubnetIds: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+        SecurityGroupIds:
+          - !Ref MySecurityGroup
+        PrivateDnsEnabled: true
+    SSMEndpoint:
+      Type: AWS::EC2::VPCEndpoint
+      Properties:
+        ServiceName: !Sub 'com.amazonaws.#{AWS::Region}.ssm'
+        VpcEndpointType: Interface
+        VpcId: vpc-0e0502c7887a495dd
+        SubnetIds: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+        SecurityGroupIds:
+          - !Ref MySecurityGroup
+        PrivateDnsEnabled: true
+    LogsEndpoint:
+      Type: AWS::EC2::VPCEndpoint
+      Properties:
+        ServiceName: !Sub 'com.amazonaws.#{AWS::Region}.logs'
+        VpcEndpointType: Interface
+        VpcId: vpc-0e0502c7887a495dd
+        SubnetIds: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+        SecurityGroupIds:
+          - !Ref MySecurityGroup
+        PrivateDnsEnabled: true
+    TwinMakerAPIEndpoint:
+      Type: AWS::EC2::VPCEndpoint
+      Properties:
+        ServiceName: !Sub 'com.amazonaws.#{AWS::Region}.iottwinmaker.api'
+        VpcEndpointType: Interface
+        VpcId: vpc-0e0502c7887a495dd
+        SubnetIds: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+        SecurityGroupIds:
+          - !Ref MySecurityGroup
+        PrivateDnsEnabled: true
+    ECSCluster:
+      Type: 'AWS::ECS::Cluster'
+      Properties:
+        ClusterName: PipelineFargateCluster
+    TaskDefinition: 
+      Type: AWS::ECS::TaskDefinition
+      Properties: 
+        ExecutionRoleArn: !Ref ECSRole
+        TaskRoleArn: !Ref ECSRole
+        NetworkMode: awsvpc
+        Cpu: 2048
+        Memory: 6144  
+        RequiresCompatibilities:
+          - "FARGATE"
+        ContainerDefinitions: 
+          - 
+            Name: "PipelineTaskDefinition"
+            Image: "317679510667.dkr.ecr.us-east-1.amazonaws.com/opendronemap/nodeodm"
+            PortMappings: 
+              - 
+                ContainerPort: 3000
+                HostPort: 3000
+            Essential: true
+    ECSService:
+      Type: AWS::ECS::Service
+      DependsOn: Listener
+      Properties:
+        LaunchType: FARGATE
+        Cluster:
+          Ref: "ECSCluster"
+        DesiredCount: 1
+        TaskDefinition: !Ref TaskDefinition
+        DeploymentConfiguration:
+          MaximumPercent: 100
+          MinimumHealthyPercent: 0
+        NetworkConfiguration:
+          AwsvpcConfiguration:
+            AssignPublicIp: DISABLED
+            SecurityGroups:
+              - !GetAtt MySecurityGroup.GroupId
+            Subnets:
+              - !Ref PrivateSubnet1
+              - !Ref PrivateSubnet2
+        LoadBalancers:
+          - TargetGroupArn: !Ref TargetGroup
+            ContainerPort: 3000
+            ContainerName: PipelineTaskDefinition
+    Alb:
+      Type: 'AWS::ElasticLoadBalancingV2::LoadBalancer'
+      Properties:
+        Name: PipelineAlb
+        Scheme: internal
+        Subnets:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+        Type: application
+        SecurityGroups:
+          - !GetAtt MySecurityGroup.GroupId
+    TargetGroup:
+      Type: 'AWS::ElasticLoadBalancingV2::TargetGroup'
+      Properties:
+        Name: TargetGroup
+        VpcId: vpc-0e0502c7887a495dd
+        Protocol: HTTP
+        Port: 3000
+        HealthCheckPath: /
+        TargetType: ip
+    Listener:
+      Type: 'AWS::ElasticLoadBalancingV2::Listener'
+      Properties:
+        DefaultActions:
+          - TargetGroupArn: !Ref TargetGroup
+            Type: forward
+        LoadBalancerArn: !Ref Alb
+        Port: 3000
+        Protocol: HTTP
+    JobTable:
+      Type: "AWS::DynamoDB::Table"
+      Properties:
+        TableName: ${self:custom.vars.TASK_TRACK_TABLE}
+        KeySchema:
+          - KeyType: "HASH"
+            AttributeName: "taskId"
+        AttributeDefinitions:
+          - AttributeName: "taskId"
+            AttributeType: "S"
+        BillingMode: PAY_PER_REQUEST
+    ProcessedBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: ${self:custom.vars.TWINMAKER_WORKSPACE_BUCKET}
+    TwinMakerWorkspace:
+      Type: AWS::IoTTwinMaker::Workspace
+      DependsOn: ProcessedBucket
+      Properties: 
+        Description: PipelineWorkspace
+        Role: arn:aws:iam::317679510667:role/twinmakerworkspacerole
+        S3Location: arn:aws:s3:::${self:custom.vars.TWINMAKER_WORKSPACE_BUCKET}
+        WorkspaceId: PipelineWorkspace 
+    ECSRole:
+      Type: 'AWS::IAM::Role'
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - ecs-tasks.amazonaws.com
+              Action:
+                - 'sts:AssumeRole'
+        Path: /
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+          - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+    TwinMakerRole:
+      Type: 'AWS::IAM::Role'
+      Properties:
+        RoleName: twinmakerworkspacerole
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - iottwinmaker.amazonaws.com
+              Action:
+                - 'sts:AssumeRole'
+        Path: /
+        Policies:
+          - PolicyName: root
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action: 
+                    - iottwinmaker:*
+                    - s3:*
+                    - iotsitewise:*
+                    - kinesisvideo:*
+                    - lambda:invokeFunction
+                  Resource: '*'
+                - Effect: Allow
+                  Action: 
+                    - iam:PassRole
+                  Resource: '*'
+                  Condition:
+                    StringEquals:
+                      "iam:PassedToService": "lambda.amazonaws.com"
