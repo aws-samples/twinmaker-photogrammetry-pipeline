@@ -14,7 +14,7 @@
     "devDependencies": {
         "@types/unzipper": "^0.10.5",
         "@types/uuid": "^8.3.4",
-        "aws-sdk": "^2.1152.0",
+        "aws-sdk": "^2.1354.0",
         "serverless-plugin-vpc-eni-cleanup": "^1.0.4",
         "serverless-prune-plugin": "^2.0.1",
         "serverless-webpack": "^5.7.1",
